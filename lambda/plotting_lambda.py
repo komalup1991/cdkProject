@@ -4,13 +4,11 @@ import datetime
 import matplotlib.pyplot as plt
 import os
 
-# AWS Clients
 s3_client = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
 
-# Configuration
-
 BUCKET_NAME = os.environ.get("BUCKET_NAME")
+PLOT_BUCKET_NAME = os.environ.get("PLOT_BUCKET_NAME")
 TABLE_NAME = os.environ.get("TABLE_NAME")
 PLOT_FILENAME = "plot.png"
 
@@ -51,7 +49,6 @@ def create_plot(data):
     print("Sizes:", [int(item["total_size"]) for item in data])
     sizes = [int(item["total_size"]) for item in data]
 
-    # Find the maximum size ever recorded
     max_size_ever = max(sizes) if sizes else 0  
 
     plt.figure(figsize=(15, 10))
@@ -65,7 +62,6 @@ def create_plot(data):
     plt.legend()
     plt.title("S3 Bucket Size Change Over Time")
 
-    # Format X-axis for better readability
     plt.xticks(rotation=45)
     plt.grid(True, linestyle="--", alpha=0.5)
 
@@ -73,10 +69,9 @@ def create_plot(data):
     plt.savefig(file_path)
     plt.close()
 
-    # Upload to S3
     try:
-        s3_client.upload_file(file_path, BUCKET_NAME, PLOT_FILENAME)
-        print(f"Upload successful: {PLOT_FILENAME} uploaded to S3 bucket {BUCKET_NAME}")
+        s3_client.upload_file(file_path, PLOT_BUCKET_NAME, PLOT_FILENAME)
+        print(f"Upload successful: {PLOT_FILENAME} uploaded to S3 bucket {PLOT_BUCKET_NAME}")
     except Exception as e:
         print(f"Upload failed: {e}")
 
@@ -91,7 +86,6 @@ def lambda_handler(event, context):
     print(f"Fetched data: {data}")
     create_plot(data)
     
-    # List objects in S3 to check if the file is there
     response = s3_client.list_objects_v2(Bucket=BUCKET_NAME)
     print("S3 Objects:", json.dumps(response.get("Contents", []), indent=2, default=json_serial))
 

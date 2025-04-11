@@ -4,19 +4,26 @@ import * as s3 from "aws-cdk-lib/aws-s3";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as api from "aws-cdk-lib/aws-apigateway";
 import { IAMRoleStack } from "./iam-role-stack";
-import * as s3n from "aws-cdk-lib/aws-s3-notifications";
 import { Fn } from "aws-cdk-lib";
-
+import { EventStack } from "./event-stack";
+import * as logs from "aws-cdk-lib/aws-logs";
+import { SqsEventSource } from "aws-cdk-lib/aws-lambda-event-sources";
 interface LambdaStackProps extends cdk.StackProps {
   roleStack: IAMRoleStack;
+  eventStack: EventStack;
 }
 
 export class LambdaStack extends cdk.Stack {
   public readonly sizeTrackingLambda: lambda.Function;
+  public readonly cleanerLambda: lambda.Function;
+  public readonly loggingLambdaLogGroup: logs.ILogGroup;
 
   constructor(scope: Construct, id: string, props: LambdaStackProps) {
     super(scope, id, props);
 
+    const bucketName = cdk.Fn.importValue("MyBucketName");
+    const tableName = cdk.Fn.importValue("MyTableName");
+    const plotBucketName = cdk.Fn.importValue("PlotBucketName");
     const matplotlibLayer = lambda.LayerVersion.fromLayerVersionArn(
       this,
       "matplotlibLayer",
@@ -34,10 +41,6 @@ export class LambdaStack extends cdk.Stack {
       "requestsLayer",
       "arn:aws:lambda:us-west-1:770693421928:layer:Klayers-p311-requests:15",
     );
-
-    const bucketName = cdk.Fn.importValue("MyBucketName");
-    const tableName = cdk.Fn.importValue("MyTableName");
-
     const bucket = s3.Bucket.fromBucketAttributes(this, "ImportedBucket", {
       bucketArn: Fn.importValue("MyBucketArn"),
     });
@@ -51,14 +54,8 @@ export class LambdaStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(210),
       environment: {
         TABLE_NAME: tableName,
+        QUEUE_URL: props.eventStack.sizeTrackingQueue.queueUrl,
       },
-    });
-
-    this.addS3EventNotifications(bucket);
-
-    new cdk.CfnOutput(this, "SizeTrackingLambdaARN", {
-      value: this.sizeTrackingLambda.functionArn,
-      description: "ARN of the Size Tracking Lambda",
     });
 
     const plottingLambda = new lambda.Function(this, "PlottingLambda", {
@@ -72,7 +69,7 @@ export class LambdaStack extends cdk.Stack {
       environment: {
         BUCKET_NAME: bucketName,
         TABLE_NAME: tableName,
-        MPLCONFIGDIR: "/tmp",
+        PLOT_BUCKET_NAME: plotBucketName,
       },
     });
 
@@ -80,17 +77,30 @@ export class LambdaStack extends cdk.Stack {
       restApiName: "PlottingAPI",
     });
 
-    const plottingResource = plottingApiGateway.root.addResource("plot");
-    plottingResource.addMethod(
-      "GET",
-      new api.LambdaIntegration(plottingLambda),
-    );
+    plottingApiGateway.root
+      .addResource("plot")
+      .addMethod("GET", new api.LambdaIntegration(plottingLambda));
 
     const plottingApiUrl = plottingApiGateway.url;
-
     new cdk.CfnOutput(this, "PlottingApiUrl", {
       description: "Invoke URL for the Plotting API Gateway",
       value: plottingApiUrl,
+    });
+
+    this.cleanerLambda = new lambda.Function(this, "CleanerLambda", {
+      runtime: lambda.Runtime.PYTHON_3_11,
+      functionName: "cleaner_lambda",
+      handler: "cleaner_lambda.lambda_handler",
+      role: props.roleStack.cleanerRole,
+      code: lambda.Code.fromAsset("lambda"),
+      timeout: cdk.Duration.seconds(210),
+      environment: {
+        BUCKET_NAME: bucketName,
+      },
+    });
+    new cdk.CfnOutput(this, "CleanerLambdaArn", {
+      value: this.cleanerLambda.functionArn,
+      exportName: "CleanerLambdaArn",
     });
 
     new lambda.Function(this, "DriverLambda", {
@@ -98,24 +108,37 @@ export class LambdaStack extends cdk.Stack {
       handler: "driver_lambda.lambda_handler",
       runtime: lambda.Runtime.PYTHON_3_11,
       role: props.roleStack.driverRole,
-      code: lambda.Code.fromAsset("lambda"),
       layers: [requestsLayer],
+      code: lambda.Code.fromAsset("lambda"),
       timeout: cdk.Duration.seconds(210),
       environment: {
         BUCKET_NAME: bucketName,
         PLOTTING_API_URL: plottingApiUrl,
       },
     });
-  }
 
-  public addS3EventNotifications(bucket: s3.IBucket) {
-    bucket.addEventNotification(
-      s3.EventType.OBJECT_CREATED,
-      new s3n.LambdaDestination(this.sizeTrackingLambda),
+    const loggingLambda = new lambda.Function(this, "LoggingLambda", {
+      runtime: lambda.Runtime.PYTHON_3_11,
+      functionName: "logging_lambda",
+      handler: "logging_lambda.lambda_handler",
+      role: props.roleStack.loggingRole,
+      code: lambda.Code.fromAsset("lambda"),
+      timeout: cdk.Duration.seconds(210),
+      logRetention: logs.RetentionDays.ONE_MONTH,
+      environment: {
+        LOG_GROUP_NAME: "/aws/lambda/logging_lambda",
+      },
+    });
+    this.loggingLambdaLogGroup = loggingLambda.logGroup;
+    props.eventStack.sizeTrackingQueue.grantConsumeMessages(
+      this.sizeTrackingLambda,
     );
-    bucket.addEventNotification(
-      s3.EventType.OBJECT_REMOVED,
-      new s3n.LambdaDestination(this.sizeTrackingLambda),
+    props.eventStack.loggingQueue.grantConsumeMessages(loggingLambda);
+    this.sizeTrackingLambda.addEventSource(
+      new SqsEventSource(props.eventStack.sizeTrackingQueue),
+    );
+    loggingLambda.addEventSource(
+      new SqsEventSource(props.eventStack.loggingQueue),
     );
   }
 }
